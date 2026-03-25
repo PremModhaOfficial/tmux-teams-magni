@@ -1,135 +1,119 @@
 #!/usr/bin/env bash
-# helpers.sh - Shared utilities for tmux-teams-magni
-# All configurable values flow through tmux options (@magni-*)
+# helpers.sh - Logging, identity, and state management for tmux-teams-magni
 
-# Get a tmux option value, falling back to a default
-get_tmux_option() {
-    local option="$1"
-    local default_value="$2"
-    local value
-    value=$(tmux show-option -gqv "$option" 2>/dev/null)
-    if [[ -z "$value" ]]; then
-        echo "$default_value"
-    else
-        echo "$value"
+set -euo pipefail
+
+CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source config.sh if not already loaded (source guard prevents circular dependency)
+if ! declare -f get_tmux_option &>/dev/null; then
+    source "$CURRENT_DIR/config.sh"
+fi
+
+# Multi-user safe base directory
+MAGNI_BASE_DIR="/tmp/tmux-magni-${UID}"
+
+# log_magni(level, message...) — log with level filtering
+# Level order: DEBUG < INFO < WARN < ERROR
+log_magni() {
+    local level="$1"
+    shift
+    local message="$*"
+
+    local configured_level
+    configured_level=$(get_tmux_option "@magni-log-level" "INFO")
+
+    local -A level_order=([DEBUG]=0 [INFO]=1 [WARN]=2 [ERROR]=3)
+    local msg_num="${level_order[$level]:-1}"
+    local cfg_num="${level_order[$configured_level]:-1}"
+
+    if [[ "$msg_num" -lt "$cfg_num" ]]; then
+        return 0
     fi
+
+    mkdir -p "$MAGNI_BASE_DIR"
+    local log_file="$MAGNI_BASE_DIR/magni.log"
+    local max_size=102400  # 100KB
+
+    if [[ -f "$log_file" ]] && [[ $(stat -c%s "$log_file" 2>/dev/null || echo 0) -gt $max_size ]]; then
+        tail -200 "$log_file" > "${log_file}.tmp" && mv "${log_file}.tmp" "$log_file"
+    fi
+
+    local id
+    id=$(daemon_id 2>/dev/null || echo "magni-unknown")
+    echo "[$(date '+%H:%M:%S')] [$level] [$id] $message" >> "$log_file"
 }
 
-# Get window-level option with global fallback
-get_window_option() {
-    local option="$1"
-    local default_value="$2"
-    local value
-    value=$(tmux show-window-option -qv "$option" 2>/dev/null)
-    if [[ -z "$value" ]]; then
-        get_tmux_option "$option" "$default_value"
-    else
-        echo "$value"
-    fi
-}
-
-# Unique daemon identifier for this session+window
+# daemon_id() — returns "magni-${session_id}-${window_id}"
 daemon_id() {
-    local session window
-    session=$(tmux display-message -p '#{session_id}' 2>/dev/null)
-    window=$(tmux display-message -p '#{window_id}' 2>/dev/null)
-    echo "magni-${session}-${window}"
+    local session_id window_id
+    session_id=$(tmux display-message -p '#{session_id}' 2>/dev/null)
+    window_id=$(tmux display-message -p '#{window_id}' 2>/dev/null)
+    echo "magni-${session_id}-${window_id}"
 }
 
+# pid_file() — returns path to PID file for current daemon
 pid_file() {
-    echo "/tmp/tmux-$(daemon_id).pid"
+    echo "$MAGNI_BASE_DIR/$(daemon_id).pid"
 }
 
+# state_dir() — returns state directory for current daemon, creating it if needed
 state_dir() {
-    local dir="/tmp/tmux-magni-state/$(daemon_id)"
+    local dir="$MAGNI_BASE_DIR/state/$(daemon_id)/"
     mkdir -p "$dir"
     echo "$dir"
 }
 
-# Hash pane content for change detection
-capture_pane_hash() {
-    local pane_id="$1"
-    tmux capture-pane -t "$pane_id" -p 2>/dev/null | cksum | cut -d' ' -f1
-}
+# is_daemon_running() — checks if a magni daemon is alive
+# Returns 0 if running, 1 if not
+is_daemon_running() {
+    local pf
+    pf=$(pid_file)
 
-# Check last lines of pane for OMC idle keywords
-# Returns 0 (true) if idle keywords detected, 1 otherwise
-check_omc_idle_keywords() {
-    local pane_id="$1"
-    local content
-    content=$(tmux capture-pane -t "$pane_id" -p -S -5 2>/dev/null)
-    # OMC agents show these words when idle
-    if echo "$content" | grep -qiE '(Baked for|Brewed for|Cogitated for|Pondered for|idle|waiting)'; then
-        return 0
-    fi
-    return 1
-}
+    [[ -f "$pf" ]] || return 1
 
-# Discover which panes to manage (vertical stack detection)
-# Strategy: group panes by pane_left, manage the group with most members
-get_managed_panes() {
-    local window_id
-    window_id=$(tmux display-message -p '#{window_id}' 2>/dev/null)
+    local pid
+    pid=$(cat "$pf")
+    [[ -n "$pid" ]] || return 1
 
-    # Get all pane info: pane_id, pane_left, pane_top
-    local pane_data
-    pane_data=$(tmux list-panes -t "$window_id" -F '#{pane_id}:#{pane_left}:#{pane_top}' 2>/dev/null)
+    kill -0 "$pid" 2>/dev/null || return 1
 
-    local pane_count
-    pane_count=$(echo "$pane_data" | wc -l)
-
-    # Need at least 2 panes total (1 orchestrator + 1 agent minimum)
-    if [[ "$pane_count" -lt 2 ]]; then
-        return
-    fi
-
-    # Find the pane_left value shared by the most panes (the vertical stack)
-    local best_left=""
-    local best_count=0
-
-    while IFS= read -r left_val; do
-        local count
-        count=$(echo "$pane_data" | awk -F: -v l="$left_val" '$2 == l' | wc -l)
-        if [[ "$count" -gt "$best_count" ]]; then
-            best_count=$count
-            best_left=$left_val
+    # On Linux, verify cmdline contains "magni" (skip if /proc unavailable)
+    if [[ -d /proc ]]; then
+        local cmdline_file="/proc/${pid}/cmdline"
+        if [[ -f "$cmdline_file" ]]; then
+            grep -q "magni" "$cmdline_file" 2>/dev/null || return 1
         fi
-    done < <(echo "$pane_data" | cut -d: -f2 | sort -u)
-
-    # Only manage if there are 2+ panes in the stack
-    if [[ "$best_count" -ge 2 ]]; then
-        # Return pane IDs sorted by pane_top (top to bottom)
-        echo "$pane_data" | awk -F: -v l="$best_left" '$2 == l { print $1":"$3 }' \
-            | sort -t: -k2 -n | cut -d: -f1
     fi
+
+    return 0
 }
 
-# Get current height of a pane
-get_pane_height() {
-    local pane_id="$1"
-    tmux display-message -t "$pane_id" -p '#{pane_height}' 2>/dev/null
-}
+# cleanup_stale_state(state_dir, managed_pane_ids_string)
+# Deletes hash_* and idle_* files whose pane ID suffix is NOT in managed_pane_ids_string
+# managed_pane_ids_string is a newline-separated list of pane IDs
+cleanup_stale_state() {
+    local sd="$1"
+    local managed_ids="$2"
 
-# Get total available height for managed panes
-get_total_managed_height() {
-    local total=0
-    local pane_id
-    while IFS= read -r pane_id; do
-        [[ -z "$pane_id" ]] && continue
-        local h
-        h=$(get_pane_height "$pane_id")
-        total=$((total + h))
+    [[ -d "$sd" ]] || return 0
+
+    local f basename pane_suffix
+    for f in "$sd"/hash_* "$sd"/idle_*; do
+        [[ -f "$f" ]] || continue
+        basename="${f##*/}"
+        # suffix after first underscore, with underscores restored to %
+        pane_suffix="${basename#*_}"
+        pane_suffix="${pane_suffix//_/%}"
+        if ! echo "$managed_ids" | grep -qF "$pane_suffix"; then
+            rm -f "$f"
+        fi
     done
-    echo "$total"
 }
 
-log_magni() {
-    local level="$1"
-    shift
-    local log_file="/tmp/tmux-magni.log"
-    local max_size=102400  # 100KB
-    if [[ -f "$log_file" ]] && [[ $(stat -c%s "$log_file" 2>/dev/null || echo 0) -gt $max_size ]]; then
-        tail -100 "$log_file" > "${log_file}.tmp" && mv "${log_file}.tmp" "$log_file"
-    fi
-    echo "[$(date '+%H:%M:%S')] [$level] $*" >> "$log_file"
+# abs_val(number) — returns absolute value
+# Strips leading minus sign; works for all integers (POSIX pattern)
+abs_val() {
+    local n="$1"
+    echo "${n#-}"
 }

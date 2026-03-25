@@ -13,21 +13,29 @@
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ─── Default Options (override in tmux.conf) ───────────────────────────
-# Poll interval in seconds
+# ── Default Options ──────────────────────────────────────────────────────
+# All options use -gq (global, quiet — won't override user values already set)
 tmux set-option -gq @magni-poll-interval "1"
-# Minimum pane height (lines) for idle panes
 tmux set-option -gq @magni-min-height "4"
-# Seconds of no content change before a pane is considered idle
 tmux set-option -gq @magni-idle-threshold "3"
-# Enable/disable the plugin (1=on, 0=off)
 tmux set-option -gq @magni-enabled "1"
+tmux set-option -gq @magni-max-daemons "5"
+tmux set-option -gq @magni-idle-keywords "Baked for|Brewed for|Cogitated for|Pondered for|idle|waiting"
+tmux set-option -gq @magni-log-level "INFO"
+tmux set-option -gq @magni-deadband "1"
+tmux set-option -gq @magni-detect-strategy "auto"
 
-# ─── Key Bindings ───────────────────────────────────────────────────────
-# prefix + M  → toggle magni on/off
-tmux bind-key M run-shell "$CURRENT_DIR/scripts/magni.sh toggle"
-# prefix + Alt-m → show status
-tmux bind-key M-m run-shell "$CURRENT_DIR/scripts/magni.sh status"
+# ── Key Bindings ─────────────────────────────────────────────────────────
+# Customizable via @magni-toggle-key and @magni-status-key in tmux.conf
+toggle_key=$(tmux show-option -gqv @magni-toggle-key)
+status_key=$(tmux show-option -gqv @magni-status-key)
+tmux bind-key "${toggle_key:-M}" run-shell "$CURRENT_DIR/scripts/daemon.sh toggle"
+tmux bind-key "${status_key:-M-m}" run-shell "$CURRENT_DIR/scripts/daemon.sh status"
 
-# ─── Auto-start Daemon ─────────────────────────────────────────────────
-tmux run-shell -b "$CURRENT_DIR/scripts/magni.sh start"
+# ── Lifecycle Hooks ──────────────────────────────────────────────────────
+# Bug 10 fix: clean up daemons and state when sessions/windows close
+tmux set-hook -ga session-closed "run-shell '$CURRENT_DIR/scripts/daemon.sh cleanup-session'"
+tmux set-hook -ga window-closed "run-shell '$CURRENT_DIR/scripts/daemon.sh cleanup-window'"
+
+# ── Auto-start ───────────────────────────────────────────────────────────
+tmux run-shell -b "$CURRENT_DIR/scripts/daemon.sh start"
